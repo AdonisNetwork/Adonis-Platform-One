@@ -2,160 +2,201 @@ import os
 import time
 import json
 import psycopg2
+import traceback
 import redis
-import requests
 import uuid
 
+# -------------------------------------------------------------------
+#  Worker Configuration
+# -------------------------------------------------------------------
+
 DB_DSN = os.getenv("DB_DSN")
-REDIS_ADDR = os.getenv("REDIS_ADDR", "redis:6379")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")  # مثال
+REDIS_ADDR = os.getenv("REDIS_ADDR", "redis://localhost:6379")
+QUEUE_NAME = os.getenv("JOBS_QUEUE_NAME", "jobs_queue")
+POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL", "0.5"))
 
-r = redis.Redis.from_url(f"redis://{REDIS_ADDR}")
+# -------------------------------------------------------------------
+#  Database & Redis Connections
+# -------------------------------------------------------------------
 
-def get_db_conn():
+def connect_postgres():
     return psycopg2.connect(DB_DSN)
 
-def call_groq(prompt: str) -> str:
+def connect_redis():
+    return redis.Redis.from_url(REDIS_ADDR, decode_responses=True)
+
+# -------------------------------------------------------------------
+#  Event Logger
+# -------------------------------------------------------------------
+
+def log_event(conn, job_id, event_type, payload=None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO job_events (job_id, event_type, payload)
+            VALUES (%s, %s, %s)
+            """,
+            (str(job_id), event_type, json.dumps(payload) if payload else None)
+        )
+    conn.commit()
+
+# -------------------------------------------------------------------
+#  Job Status Updater
+# -------------------------------------------------------------------
+
+def update_status(conn, job_id, status, status_reason=None, result_markdown=None, result_json=None, error_text=None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+            SET status = %s,
+                status_reason = %s,
+                result_markdown = %s,
+                result_json = %s,
+                error_text = %s,
+                updated_at = NOW()
+            WHERE id = %s
+            """,
+            (
+                status,
+                status_reason,
+                result_markdown,
+                json.dumps(result_json) if result_json else None,
+                error_text,
+                str(job_id),
+            ),
+        )
+    conn.commit()
+
+# -------------------------------------------------------------------
+#  AI Task Execution (MVP version)
+#   Groq / OpenAI / Local LLM / Agents
+# -------------------------------------------------------------------
+
+def execute_task(task_type, input_text, input_meta):
     """
-    ساده: یک call به Groq LLM – بسته به API نهایی، این را تنظیم می‌کنی.
-    """
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": "You are a precise research assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices[0][message][content]"] if False else data["choices"][0]["message"]["content"]
-
-def run_research_agent(input_text: str):
-    """
-    Multi-step pipeline: Understanding → Plan → Research → Structure (JSON + Markdown)
+    MVP:
+        - multi-agent A1 runtime
+        - Groq LPU inference
+        - OpenAI GPT-4.1
+        - Local models (edge)
+        - Tool calling
     """
 
-    # Step 1: Understanding & Reframing
-    understanding_prompt = f"""
-You are a research planner. The user request is:
-
-\"\"\"{input_text}\"\"\" 
-
-1) Rewrite it as a clear research question.
-2) Identify 3–5 key sub-questions.
-3) Identify best sources (regulators, scientific, industry).
-Respond in JSON with fields: research_question, sub_questions, sources.
-"""
-    understanding_raw = call_groq(understanding_prompt)
-
-    try:
-        plan = json.loads(understanding_raw)
-    except Exception:
-        # fallback: wrap raw in JSON
-        plan = {
-            "research_question": input_text,
-            "sub_questions": [],
-            "sources": [],
-            "raw": understanding_raw,
+    return {
+        "markdown": f"### Task: {task_type}\n\nInput:\n```\n{input_text}\n```",
+        "json": {
+            "task": task_type,
+            "input": input_text,
+            "meta": input_meta,
+            "processed_at": time.time(),
         }
+    }
 
-    # Step 2: Main Research & Synthesis (still single LLM call in MVP)
-    synthesis_prompt = f"""
-You are a senior research analyst.
+# -------------------------------------------------------------------
+#  Worker Loop
+# -------------------------------------------------------------------
 
-Research question:
-{plan.get("research_question", input_text)}
+def worker_loop():
+    redis_client = connect_redis()
 
-Sub-questions:
-{json.dumps(plan.get("sub_questions", []), ensure_ascii=False)}
+    print("[A1 Worker] Connected to Redis:", REDIS_ADDR)
+    print("[A1 Worker] Listening on queue:", QUEUE_NAME)
 
-Sources (preferred types or organizations):
-{json.dumps(plan.get("sources", []), ensure_ascii=False)}
-
-Write a structured research report with these sections:
-1. Overview
-2. Key Findings
-3. Entities / Devices / Stakeholders (if any)
-4. Regulatory or Strategic Trends
-5. Risks & Limitations
-6. Actionable Insights for decision-makers
-
-Return the answer in TWO parts:
-
-[MARKDOWN]
-<full markdown report here>
-
-[JSON]
-A minified JSON object with:
-- title
-- sections (id, title, content)
-- insights (list of strings)
-- risks (list of strings)
-- citations (list of objects: source, url, snippet if known)
-"""
-    synthesis_raw = call_groq(synthesis_prompt)
-
-    # ساده: split بین [MARKDOWN] و [JSON]
-    markdown_part = ""
-    json_part = {}
-
-    if "[JSON]" in synthesis_raw:
-        md_part, js_part = synthesis_raw.split("[JSON]", 1)
-        markdown_part = md_part.replace("[MARKDOWN]", "").strip()
-        try:
-            json_part = json.loads(js_part.strip())
-        except Exception:
-            json_part = {"raw": js_part.strip()}
-    else:
-        markdown_part = synthesis_raw
-        json_part = {"raw": synthesis_raw}
-
-    return markdown_part, json_part
-
-def process_job(job_id: str):
-    conn = get_db_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-
-    # mark as running & get input
-    cur.execute("UPDATE jobs SET status='running' WHERE id=%s", (job_id,))
-    cur.execute("SELECT input_text FROM jobs WHERE id=%s", (job_id,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return
-    input_text = row[0]
-
-    try:
-        markdown, json_result = run_research_agent(input_text)
-        cur.execute(
-            "UPDATE jobs SET status='completed', result_markdown=%s, result_json=%s, error_text=NULL WHERE id=%s",
-            (markdown, json.dumps(json_result, ensure_ascii=False), job_id),
-        )
-    except Exception as e:
-        cur.execute(
-            "UPDATE jobs SET status='failed', error_text=%s WHERE id=%s",
-            (str(e), job_id),
-        )
-    finally:
-        conn.close()
-
-def main_loop():
-    print("Worker started, listening for jobs...")
     while True:
-        # BRPOP → queue name, timeout=0 → block
-        _, job_id_bytes = r.brpop("jobs_queue")
-        job_id = job_id_bytes.decode("utf-8")
-        print("Processing job:", job_id)
-        process_job(job_id)
+        try:
+            job_id = redis_client.rpop(QUEUE_NAME)
+
+            if not job_id:
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            print(f"[A1 Worker] → Received Job: {job_id}")
+
+            conn = connect_postgres()
+
+            # Load job
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT task_type, input_text, input_meta
+                    FROM jobs
+                    WHERE id = %s
+                    """,
+                    (job_id,)
+                )
+                row = cur.fetchone()
+
+            if not row:
+                print("[A1 Worker] WARNING: Job not found:", job_id)
+                continue
+
+            task_type, input_text, input_meta_raw = row
+
+            input_meta = None
+            if input_meta_raw:
+                try:
+                    input_meta = json.loads(input_meta_raw)
+                except:
+                    input_meta = {}
+
+            # -------------------------------------------
+            # Update → processing
+            # -------------------------------------------
+            update_status(conn, job_id, "processing", "job started")
+            log_event(conn, job_id, "processing", {"info": "Job execution started"})
+
+            # -------------------------------------------
+            # Execute Task
+            # -------------------------------------------
+            try:
+                result = execute_task(task_type, input_text, input_meta)
+
+                update_status(
+                    conn,
+                    job_id,
+                    "completed",
+                    "job finished",
+                    result_markdown=result["markdown"],
+                    result_json=result["json"],
+                )
+
+                log_event(conn, job_id, "completed", result["json"])
+
+                print(f"[A1 Worker] ✓ Job Completed: {job_id}")
+
+            except Exception as e:
+                error_msg = traceback.format_exc()
+
+                update_status(
+                    conn,
+                    job_id,
+                    "failed",
+                    "worker error",
+                    error_text=error_msg,
+                )
+
+                log_event(
+                    conn,
+                    job_id,
+                    "failed",
+                    {"error": str(e), "trace": error_msg},
+                )
+
+                print(f"[A1 Worker] ✗ Job Failed: {job_id}")
+                print(error_msg)
+
+            finally:
+                conn.close()
+
+        except Exception as e:
+            print("[A1 Worker] CRITICAL ERROR:", e)
+            time.sleep(1)
+
+# -------------------------------------------------------------------
+#  Main Entry
+# -------------------------------------------------------------------
 
 if __name__ == "__main__":
-    main_loop()
+    print("[A1 Worker] Starting...")
+    worker_loop()
