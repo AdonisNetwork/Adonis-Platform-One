@@ -2,144 +2,93 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
-	"github.com/google/uuid"
+	"context"
+
+	"github.com/go-chi/chi/v5"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
-	"context"
-	"time"
+
+	"a1/internal/handlers"
+	"a1/internal/queue"
+	"a1/internal/repo"
+	"a1/internal/services"
 )
 
-type Server struct {
-	db    *sql.DB
-	redis *redis.Client
-}
-
-type createJobRequest struct {
-	Task  string `json:"task"`
-	Input string `json:"input"`
-}
-
 func main() {
+	// 1) Config
 	dsn := os.Getenv("DB_DSN")
+	if dsn == "" {
+		log.Fatal("DB_DSN is required")
+	}
+
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "redis:6379"
+	}
+
+	// 2) DB
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
+	if err := db.Ping(); err != nil {
+		log.Fatal("cannot connect to database:", err)
+	}
+
+	// 3) Redis
 	rdb := redis.NewClient(&redis.Options{
-		Addr: os.Getenv("REDIS_ADDR"),
+		Addr: redisAddr,
 	})
 
-	s := &Server{db: db, redis: rdb}
+	if err := pingRedis(rdb); err != nil {
+		log.Fatal("cannot connect to redis:", err)
+	}
 
-	http.HandleFunc("/api/jobs", s.handleCreateJob)
-	http.HandleFunc("/api/jobs/", s.handleGetJob)
+	// 4) Wiring layers
+	jobRepo := repo.NewJobRepository(db)
+	jobQueue := queue.NewRedisJobQueue(rdb, "jobs_queue")
+	jobService := services.NewJobService(jobRepo, jobQueue)
+	jobHandler := handlers.NewJobHandler(jobService)
+
+	// 5) Router (versioned API)
+	r := chi.NewRouter()
+
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"ok"}`))
+	})
+
+	r.Route("/api/v1", func(api chi.Router) {
+		jobHandler.RegisterRoutes(api)
+	})
 
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
-	log.Println("API listening on", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+	}
+
+	log.Println("A1 API listening on", addr)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req createJobRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	if req.Task == "" || req.Input == "" {
-		http.Error(w, "task and input required", http.StatusBadRequest)
-		return
-	}
-
-	id := uuid.New()
-
-	_, err := s.db.Exec(
-		`INSERT INTO jobs (id, task_type, input_text, status) VALUES ($1, $2, $3, $4)`,
-		id, req.Task, req.Input, "queued",
-	)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	// push to Redis queue
+func pingRedis(rdb *redis.Client) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.redis.LPush(ctx, "jobs_queue", id.String()).Err(); err != nil {
-		http.Error(w, "queue error", http.StatusInternalServerError)
-		return
-	}
-
-	resp := map[string]interface{}{
-		"job_id": id.String(),
-		"status": "queued",
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	idStr := r.URL.Path[len("/api/jobs/"):]
-	if idStr == "" {
-		http.Error(w, "job id required", http.StatusBadRequest)
-		return
-	}
-
-	var (
-		taskType, status, input, resultMarkdown, errorText sql.NullString
-		resultJSON                                         []byte
-		createdAt, updatedAt                               time.Time
-	)
-	err := s.db.QueryRow(`
-		SELECT task_type, status, input_text, result_markdown, result_json, error_text, created_at, updated_at
-		FROM jobs WHERE id = $1
-	`, idStr).Scan(&taskType, &status, &input, &resultMarkdown, &resultJSON, &errorText, &createdAt, &updatedAt)
-
-	if err == sql.ErrNoRows {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	var jsonResult interface{}
-	if len(resultJSON) > 0 {
-		_ = json.Unmarshal(resultJSON, &jsonResult)
-	}
-
-	resp := map[string]interface{}{
-		"job_id":          idStr,
-		"task_type":       taskType.String,
-		"status":          status.String,
-		"input":           input.String,
-		"result_markdown": resultMarkdown.String,
-		"result_json":     jsonResult,
-		"error":           errorText.String,
-		"created_at":      createdAt,
-		"updated_at":      updatedAt,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	_, err := rdb.Ping(ctx).Result()
+	return err
 }
